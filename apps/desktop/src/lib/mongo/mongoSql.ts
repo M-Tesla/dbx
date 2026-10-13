@@ -59,8 +59,13 @@ class ShellCtor {
 
 type ShellValue = null | boolean | number | string | ShellCtor | ShellValue[] | { [key: string]: ShellValue };
 
+interface FieldPart {
+  name: string;
+  indexes: number[];
+}
+
 interface FieldRef {
-  parts: string[];
+  parts: FieldPart[];
 }
 
 type Expr =
@@ -208,7 +213,7 @@ class Parser {
     do {
       const field = this.parseFieldRef();
       this.expectOp("=");
-      set[field.parts.join(".")] = this.parseLiteral();
+      set[expandedNames(field).join(".")] = this.parseLiteral();
     } while (this.eatOp(","));
     const where = this.eatKeyword("where") ? this.parseExpr() : undefined;
     this.expectEnd();
@@ -292,8 +297,8 @@ class Parser {
     const right = this.parseFieldRef();
     const baseNames = new Set([base.alias?.toLowerCase(), base.collection.toLowerCase()].filter((name): name is string => !!name));
     const joinNames = new Set([table.alias?.toLowerCase(), table.collection.toLowerCase()].filter((name): name is string => !!name));
-    const leftOwner = left.parts[0]?.toLowerCase();
-    const rightOwner = right.parts[0]?.toLowerCase();
+    const leftOwner = left.parts[0]?.name.toLowerCase();
+    const rightOwner = right.parts[0]?.name.toLowerCase();
     const local = baseNames.has(leftOwner ?? "") ? left : baseNames.has(rightOwner ?? "") ? right : undefined;
     const foreign = joinNames.has(leftOwner ?? "") ? left : joinNames.has(rightOwner ?? "") ? right : undefined;
     if (!local || !foreign || local === foreign) {
@@ -309,7 +314,9 @@ class Parser {
       let direction: 1 | -1 = 1;
       if (this.eatKeyword("desc")) direction = -1;
       else this.eatKeyword("asc");
-      keys.push({ name: field.parts[field.parts.length - 1] ?? field.parts.join("."), direction });
+      const names = expandedNames(field);
+      const name = fieldHasIndex(field) ? names.join(".") : (names[names.length - 1] ?? names.join("."));
+      keys.push({ name, direction });
     } while (this.eatOp(","));
     return keys;
   }
@@ -459,9 +466,28 @@ class Parser {
   }
 
   private parseFieldRef(): FieldRef {
-    const parts = [this.nextIdent()];
-    while (this.eatOp(".")) parts.push(this.nextIdent());
+    const parts = [this.parseFieldPart()];
+    while (this.eatOp(".")) parts.push(this.parseFieldPart());
     return { parts };
+  }
+
+  private parseFieldPart(): FieldPart {
+    const name = this.nextIdent();
+    const indexes: number[] = [];
+    while (this.eatOp("[")) {
+      indexes.push(this.parseArrayIndex());
+      this.expectOp("]");
+    }
+    return { name, indexes };
+  }
+
+  private parseArrayIndex(): number {
+    const negative = this.eatOp("-");
+    const token = this.next();
+    if (token.kind !== "number" || !Number.isInteger(token.value) || token.value < 0) {
+      throw new MongoSqlError("Array index requires an integer.");
+    }
+    return negative ? -token.value : token.value;
   }
 
   private parseInteger(label: string): number {
@@ -628,7 +654,7 @@ function tokenize(sql: string): Tok[] {
       i += 2;
       continue;
     }
-    if ("(),.*=>".includes(ch) || ch === "<") {
+    if ("(),.*=>[]".includes(ch) || ch === "<" || ch === "-") {
       tokens.push({ kind: "op", text: ch });
       i += 1;
       continue;
@@ -707,8 +733,8 @@ function projectionForFind(items: SelectItem[]): ShellValue | undefined {
   let includesId = false;
   for (const item of items) {
     if (item.type !== "field" || !item.field) continue;
-    const path = item.field.parts.join(".");
-    projection[path] = 1;
+    const path = expandedNames(item.field).join(".");
+    projection[path] = fieldHasIndex(item.field) ? arrayValueExpr(item.field, "base") : 1;
     if (path === "_id") includesId = true;
   }
   if (!includesId) projection._id = 0;
@@ -721,7 +747,7 @@ function assertGroupedColumns(items: SelectItem[], groupBy: FieldRef[], aliases:
     if (item.type !== "field" || !item.field) continue;
     const path = fieldPath(item.field, aliases, from).path;
     if (!grouped.has(path)) {
-      throw new MongoSqlError(`Column ${item.field.parts.join(".")} must appear in GROUP BY or inside an aggregate function.`);
+      throw new MongoSqlError(`Column ${expandedNames(item.field).join(".")} must appear in GROUP BY or inside an aggregate function.`);
     }
   }
 }
@@ -762,11 +788,11 @@ function groupProject(items: SelectItem[], groupBy: FieldRef[], aliases: AliasMa
   if (selected.length === 0) return undefined;
   const project: Record<string, ShellValue> = {};
   for (const item of selected) {
-    const name = item.alias ?? item.field?.parts[item.field.parts.length - 1];
+    const name = item.alias ?? item.field?.parts[item.field.parts.length - 1]?.name;
     if (!name) continue;
     project[name] = "$_id";
   }
-  if (!(grouped in project) && selected.some((item) => (item.alias ?? item.field?.parts.at(-1)) === grouped)) {
+  if (!(grouped in project) && selected.some((item) => (item.alias ?? item.field?.parts.at(-1)?.name) === grouped)) {
     project[grouped] = "$_id";
   }
   const used = new Set<string>();
@@ -785,9 +811,10 @@ function projectStage(items: SelectItem[], aliases: AliasMap, from: TableRef): S
   for (const item of items) {
     if (item.type === "field" && item.field) {
       const resolved = fieldPath(item.field, aliases, from);
-      const name = item.alias ?? resolved.path.split(".").pop() ?? resolved.path;
+      const dotted = resolved.owner === "base" ? resolved.path : `${resolved.owner}.${resolved.path}`;
+      const name = item.alias ?? (fieldHasIndex(item.field) ? dotted : (resolved.path.split(".").pop() ?? resolved.path));
       const source = resolved.owner === "base" ? resolved.path : `${resolved.owner}.${resolved.path}`;
-      project[name] = item.alias || resolved.owner !== "base" ? `$${source}` : 1;
+      project[name] = fieldHasIndex(item.field) ? arrayValueExpr(item.field, resolved.owner) : item.alias || resolved.owner !== "base" ? `$${source}` : 1;
       if (name === "_id") includesId = true;
     }
   }
@@ -800,7 +827,7 @@ function aggregateName(item: SelectItem, used: Set<string>): string {
     used.add(item.alias);
     return item.alias;
   }
-  const base = item.fn === "count" && item.star ? "count" : `${item.fn}_${item.field?.parts.at(-1) ?? "value"}`;
+  const base = item.fn === "count" && item.star ? "count" : `${item.fn}_${item.field?.parts.at(-1)?.name ?? "value"}`;
   let name = base;
   let n = 2;
   while (used.has(name)) {
@@ -836,15 +863,48 @@ interface ResolvedField {
   path: string;
 }
 
+function expandedNames(field: FieldRef): string[] {
+  const names: string[] = [];
+  for (const part of field.parts) {
+    names.push(part.name);
+    for (const index of part.indexes) names.push(String(index));
+  }
+  return names;
+}
+
+function fieldHasIndex(field: FieldRef): boolean {
+  return field.parts.some((part) => part.indexes.length > 0);
+}
+
+function applyArrayIndexes(expr: ShellValue, indexes: number[]): ShellValue {
+  for (const index of indexes) expr = { $arrayElemAt: [expr, index] };
+  return expr;
+}
+
+/** Positional projection. Inclusion `{ "items.0.name": 1 }` does not select the array element. */
+function arrayValueExpr(field: FieldRef, owner: string): ShellValue {
+  const parts = owner === "base" ? field.parts : field.parts.slice(1);
+  const head = parts[0];
+  if (!head) throw new MongoSqlError("Array index requires a field.");
+  let expr: ShellValue = owner === "base" ? `$${head.name}` : `$${owner}`;
+  if (owner === "base") expr = applyArrayIndexes(expr, head.indexes);
+  for (const part of owner === "base" ? parts.slice(1) : parts) {
+    expr = { $getField: { field: part.name, input: expr } };
+    expr = applyArrayIndexes(expr, part.indexes);
+  }
+  return expr;
+}
+
 function fieldPath(field: FieldRef, aliases: AliasMap, from: TableRef): ResolvedField {
+  const names = expandedNames(field);
   const baseNames = new Set([from.alias?.toLowerCase(), from.collection.toLowerCase()].filter((name): name is string => !!name));
-  if (field.parts.length === 1) return { owner: "base", path: field.parts[0]! };
-  const head = field.parts[0]!.toLowerCase();
-  const path = field.parts.slice(1).join(".");
+  if (names.length === 1) return { owner: "base", path: names[0]! };
+  const head = names[0]!.toLowerCase();
+  const path = names.slice(1).join(".");
   if (baseNames.has(head)) return { owner: "base", path };
   const joined = aliases.joins.get(head);
   if (joined) return { owner: joined.alias ?? joined.collection, path };
-  return { owner: "base", path: field.parts.join(".") };
+  return { owner: "base", path: names.join(".") };
 }
 
 function exprToFilter(expr: Expr, aliases: AliasMap, options?: { qualifyJoin?: boolean }): ShellValue {

@@ -88,6 +88,28 @@ describe("translateMongoSqlScript", () => {
     expect(prepareMongoQueryText("SELECT * FROM users", "sql", "mysql").sql).toBe("SELECT * FROM users");
   });
 
+  it("compiles array indexes in filters and projections", () => {
+    const filtered = shell("SELECT * FROM orders WHERE addresses[0].city = 'SP' ORDER BY items[0].name");
+    expect(filtered.command.kind).toBe("find");
+    if (filtered.command.kind !== "find") return;
+    expect(JSON.parse(filtered.command.filter)).toEqual({ "addresses.0.city": "SP" });
+    expect(JSON.parse(filtered.command.sort ?? "{}")).toEqual({ "items.0.name": 1 });
+
+    const projected = shell("SELECT items[0].name FROM orders");
+    expect(projected.command.kind).toBe("find");
+    if (projected.command.kind !== "find") return;
+    expect(JSON.parse(projected.command.projection ?? "{}")).toEqual({
+      "items.0.name": { $getField: { field: "name", input: { $arrayElemAt: ["$items", 0] } } },
+      _id: 0,
+    });
+
+    const updated = shell("UPDATE orders SET items[0].name = 'kit' WHERE addresses[0].city = 'SP'");
+    expect(updated.command.kind).toBe("update");
+    if (updated.command.kind !== "update") return;
+    expect(JSON.parse(updated.command.filter)).toEqual({ "addresses.0.city": "SP" });
+    expect(JSON.parse(updated.command.update)).toEqual({ $set: { "items.0.name": "kit" } });
+  });
+
   it("rejects SQL outside the supported subset", () => {
     expect(() => translateMongoSqlScript("SELECT * FROM users UNION SELECT * FROM archived")).toThrow(MongoSqlError);
     expect(() => translateMongoSqlScript("SELECT name, ROW_NUMBER() OVER (ORDER BY name) FROM users")).toThrow(/Window functions/);
