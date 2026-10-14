@@ -516,6 +516,11 @@ export default withEnglishFallback({
     alwaysOnTop: "Manter janela no topo",
     alwaysOnTopOff: "Não manter no topo",
     blockDangerousRedisCommands: "Bloquear comandos perigosos",
+    mongoQueryLanguage: "Linguagem de consulta do MongoDB",
+    mongoShellMode: "Shell",
+    mongoSqlMode: "SQL",
+    copyMongoShell: "Copiar shell gerado",
+    mongoShellCopied: "Comando mongo shell copiado",
     multiDbExecute: "Execução em múltiplos bancos",
   },
   multiDbExecute: {
@@ -2024,6 +2029,8 @@ export default withEnglishFallback({
   queryMessages: {
     empty: "Nenhuma mensagem",
     code: "Código: {code}",
+    mongoShell: "Shell do Mongo gerado",
+    copyMongoShell: "Copiar shell",
   },
   chart: {
     title: "Gráfico",

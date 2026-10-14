@@ -110,6 +110,30 @@ describe("translateMongoSqlScript", () => {
     expect(JSON.parse(updated.command.update)).toEqual({ $set: { "items.0.name": "kit" } });
   });
 
+  it("keeps dotted ORDER BY paths and allows reserved words as names", () => {
+    const nested = shell("SELECT name FROM users ORDER BY address.city");
+    expect(nested.command.kind).toBe("find");
+    if (nested.command.kind !== "find") return;
+    expect(JSON.parse(nested.command.sort ?? "{}")).toEqual({ "address.city": 1 });
+
+    const qualified = shell("SELECT user.name FROM users ORDER BY user.name");
+    expect(qualified.command.kind).toBe("find");
+    if (qualified.command.kind !== "find") return;
+    expect(JSON.parse(qualified.command.sort ?? "{}")).toEqual({ "user.name": 1 });
+    expect(JSON.parse(qualified.command.projection ?? "{}")).toEqual({ "user.name": 1, _id: 0 });
+
+    const renamed = shell("SELECT address.city AS city FROM users ORDER BY address.city");
+    expect(renamed.command.kind).toBe("aggregate");
+    if (renamed.command.kind !== "aggregate") return;
+    const pipeline = JSON.parse(renamed.command.pipeline) as Array<Record<string, unknown>>;
+    expect(pipeline.at(-1)).toEqual({ $sort: { city: 1 } });
+
+    const named = shell("SELECT window FROM window WHERE over = 1");
+    expect(named.command.kind).toBe("find");
+    if (named.command.kind !== "find") return;
+    expect(JSON.parse(named.command.filter)).toEqual({ over: 1 });
+  });
+
   it("rejects SQL outside the supported subset", () => {
     expect(() => translateMongoSqlScript("SELECT * FROM users UNION SELECT * FROM archived")).toThrow(MongoSqlError);
     expect(() => translateMongoSqlScript("SELECT name, ROW_NUMBER() OVER (ORDER BY name) FROM users")).toThrow(/Window functions/);

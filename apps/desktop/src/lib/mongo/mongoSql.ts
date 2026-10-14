@@ -15,6 +15,9 @@ export type MongoQueryLanguage = "shell" | "sql";
  * into this Apache-2.0 app, and `node-sql-parser` unpacks to tens of megabytes.
  * This compiler covers the same shell shapes (find / aggregate / insertMany /
  * updateMany / deleteMany) and rejects everything outside that subset.
+ *
+ * `!=` becomes `$ne`, which also matches documents where the field is missing.
+ * Array-index projections use `$getField` and `$arrayElemAt`, which need MongoDB 4.4 or newer.
  */
 
 export class MongoSqlError extends Error {
@@ -101,7 +104,7 @@ interface Join {
 }
 
 interface OrderKey {
-  name: string;
+  field: FieldRef;
   direction: 1 | -1;
 }
 
@@ -118,7 +121,6 @@ const RESERVED = new Set(
 
 function translateMongoSqlStatement(sql: string): string {
   const parser = new Parser(sql);
-  parser.rejectUnsupportedShape();
   const keyword = parser.peekKeyword();
   if (keyword === "select") return parser.parseSelect();
   if (keyword === "insert") return parser.parseInsert();
@@ -134,19 +136,6 @@ class Parser {
 
   constructor(sql: string) {
     this.tokens = tokenize(sql);
-  }
-
-  rejectUnsupportedShape() {
-    const upper = this.tokens
-      .filter((token): token is Extract<Tok, { kind: "ident" }> => token.kind === "ident")
-      .map((token) => token.text.toLowerCase());
-    if (upper.includes("union") || upper.includes("intersect") || upper.includes("except")) {
-      throw new MongoSqlError("UNION, INTERSECT, and EXCEPT are not supported in MongoDB SQL mode.");
-    }
-    if (upper.includes("over") || upper.includes("window")) {
-      throw new MongoSqlError("Window functions are not supported in MongoDB SQL mode.");
-    }
-    if (upper[0] === "with") throw new MongoSqlError("WITH queries are not supported in MongoDB SQL mode.");
   }
 
   parseSelect(): string {
@@ -252,6 +241,7 @@ class Parser {
         this.expectOp(")");
         return { type: "agg", fn: name, field, alias: this.parseOptionalAlias() };
       }
+      this.skipUntilMatchingParen();
       throw new MongoSqlError(`Function ${name.toUpperCase()}() is not supported in MongoDB SQL mode.`);
     }
     const field = this.parseFieldRef();
@@ -314,9 +304,7 @@ class Parser {
       let direction: 1 | -1 = 1;
       if (this.eatKeyword("desc")) direction = -1;
       else this.eatKeyword("asc");
-      const names = expandedNames(field);
-      const name = fieldHasIndex(field) ? names.join(".") : (names[names.length - 1] ?? names.join("."));
-      keys.push({ name, direction });
+      keys.push({ field, direction });
     } while (this.eatOp(","));
     return keys;
   }
@@ -498,7 +486,20 @@ class Parser {
     return token.value;
   }
 
+  private skipUntilMatchingParen() {
+    let depth = 1;
+    while (depth > 0) {
+      const token = this.next();
+      if (token.kind === "eof") throw new MongoSqlError('Expected ")".');
+      if (token.kind === "op" && token.text === "(") depth += 1;
+      if (token.kind === "op" && token.text === ")") depth -= 1;
+    }
+  }
+
   private expectEnd() {
+    if (this.atKeyword("union") || this.atKeyword("intersect") || this.atKeyword("except")) {
+      throw new MongoSqlError("UNION, INTERSECT, and EXCEPT are not supported in MongoDB SQL mode.");
+    }
     if (this.peek().kind !== "eof") throw new MongoSqlError(`Unexpected ${this.describe(this.peek())} in MongoDB SQL mode.`);
   }
 
@@ -509,6 +510,9 @@ class Parser {
   private next(): Tok {
     const token = this.peek();
     if (token.kind !== "eof") this.index += 1;
+    if (token.kind === "op" && token.text === ")" && this.atKeyword("over")) {
+      throw new MongoSqlError("Window functions are not supported in MongoDB SQL mode.");
+    }
     return token;
   }
 
@@ -678,7 +682,7 @@ function compileSelect(items: SelectItem[], from: TableRef, joins: Join[], where
     const filter = where ? exprToFilter(where, aliases) : {};
     const projection = projectionForFind(items);
     const args = projection ? `${printShell(filter)}, ${printShell(projection)}` : printShell(filter);
-    const chain = [orderBy.length ? `.sort(${printShell(orderDocument(orderBy))})` : "", offset ? `.skip(${offset})` : "", limit !== undefined ? `.limit(${limit})` : ""].join("");
+    const chain = [orderBy.length ? `.sort(${printShell(orderDocument(orderBy, items, false, aliases, from))})` : "", offset ? `.skip(${offset})` : "", limit !== undefined ? `.limit(${limit})` : ""].join("");
     return `${mongoCall(from, "find", args)}${chain}`;
   }
     if (items.some((item) => item.type === "agg") && !groupBy) {
@@ -721,7 +725,8 @@ function compileSelect(items: SelectItem[], from: TableRef, joins: Join[], where
   } else if (items.some((item) => item.type !== "star")) {
     pipeline.push({ $project: projectStage(items, aliases, from) });
   }
-  if (orderBy.length) pipeline.push({ $sort: orderDocument(orderBy) });
+  const projectsFields = groupBy !== undefined || items.some((item) => item.type !== "star");
+  if (orderBy.length) pipeline.push({ $sort: orderDocument(orderBy, items, projectsFields, aliases, from) });
   if (offset) pipeline.push({ $skip: offset });
   if (limit !== undefined) pipeline.push({ $limit: limit });
   return mongoCall(from, "aggregate", printShell(pipeline));
@@ -838,10 +843,29 @@ function aggregateName(item: SelectItem, used: Set<string>): string {
   return name;
 }
 
-function orderDocument(orderBy: OrderKey[]): ShellValue {
+function orderDocument(orderBy: OrderKey[], items: SelectItem[], projectsFields: boolean, aliases: AliasMap, from: TableRef): ShellValue {
   const sort: Record<string, ShellValue> = {};
-  for (const key of orderBy) sort[key.name] = key.direction;
+  for (const key of orderBy) sort[sortKey(key.field, items, projectsFields, aliases, from)] = key.direction;
   return sort;
+}
+
+function sortKey(field: FieldRef, items: SelectItem[], projectsFields: boolean, aliases: AliasMap, from: TableRef): string {
+  const resolved = fieldPath(field, aliases, from);
+  const full = resolved.owner === "base" ? resolved.path : `${resolved.owner}.${resolved.path}`;
+  if (!projectsFields) return full;
+  for (const item of items) {
+    if (item.alias && item.field && sameField(item.field, field)) return item.alias;
+  }
+  if (field.parts.length === 1 && field.parts[0]!.indexes.length === 0) {
+    const alias = items.find((item) => item.alias === field.parts[0]!.name);
+    if (alias?.alias) return alias.alias;
+  }
+  if (fieldHasIndex(field)) return full;
+  return resolved.path.split(".").pop() ?? full;
+}
+
+function sameField(left: FieldRef, right: FieldRef): boolean {
+  return expandedNames(left).join(".") === expandedNames(right).join(".");
 }
 
 interface AliasMap {

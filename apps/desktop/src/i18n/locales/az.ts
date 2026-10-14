@@ -274,6 +274,11 @@ export default withEnglishFallback({
     alwaysOnTop: "Pəncərəni üstə saxla",
     alwaysOnTopOff: "Üstdə saxlamanı ləğv et",
     blockDangerousRedisCommands: "Təhlükəli əmrləri blokla",
+    mongoQueryLanguage: "MongoDB sorğu dili",
+    mongoShellMode: "Shell",
+    mongoSqlMode: "SQL",
+    copyMongoShell: "Yaradılmış shell-i kopyala",
+    mongoShellCopied: "Mongo shell əmri kopyalandı",
     multiDbExecute: "Bir neçə verilənlər bazasında icra et",
   },
   multiDbExecute: {
@@ -1780,6 +1785,8 @@ export default withEnglishFallback({
   queryMessages: {
     empty: "Mesaj yoxdur",
     code: "Kod: {code}",
+    mongoShell: "Yaradılmış mongo shell",
+    copyMongoShell: "Shell-i kopyala",
   },
   chart: {
     title: "Diaqram",
