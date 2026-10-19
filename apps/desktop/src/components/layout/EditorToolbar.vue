@@ -572,6 +572,16 @@ async function changeCatalog(selectedCatalog: string) {
     switchingCatalog.value = false;
   }
 }
+
+const connectionPickerRef = ref<InstanceType<typeof ConnectionTreeSelect> | null>(null);
+const databasePickerRef = ref<InstanceType<typeof SearchableSelect> | null>(null);
+const schemaPickerRef = ref<InstanceType<typeof SearchableSelect> | null>(null);
+
+defineExpose({
+  openConnectionPicker: () => connectionPickerRef.value?.openDropdown() ?? false,
+  openDatabasePicker: () => databasePickerRef.value?.openDropdown() ?? false,
+  openSchemaPicker: () => schemaPickerRef.value?.openDropdown() ?? false,
+});
 </script>
 
 <template>
@@ -977,6 +987,7 @@ async function changeCatalog(selectedCatalog: string) {
       <div class="flex shrink-0 items-center gap-1">
         <span v-if="activeConnection?.color" class="h-4 w-1 rounded-full shrink-0" :style="{ backgroundColor: activeConnection.color }" />
         <ConnectionTreeSelect
+          ref="connectionPickerRef"
           :model-value="activeConnectionValue"
           :connections="connectionStore.connections"
           :layout="connectionStore.sidebarLayout"
@@ -1042,6 +1053,7 @@ async function changeCatalog(selectedCatalog: string) {
         :class="{ 'database-required-prompt': databaseRequiredVisible }"
       >
         <SearchableSelect
+          ref="databasePickerRef"
           :model-value="activeDatabaseValue"
           :options="activeDatabaseOptions.length ? activeDatabaseOptions : activeDatabaseValue ? [activeDatabaseValue] : []"
           :placeholder="t('editor.selectDatabase')"
@@ -1089,6 +1101,7 @@ async function changeCatalog(selectedCatalog: string) {
       </div>
       <div v-if="showSchemaSelector" class="flex shrink-0 items-center gap-1">
         <SearchableSelect
+          ref="schemaPickerRef"
           :model-value="activeSchemaValue"
           :options="activeSchemaOptions.length ? activeSchemaOptions : activeSchemaValue ? [activeSchemaValue] : []"
           :placeholder="t('editor.selectSchema')"
