@@ -84,7 +84,9 @@ describe("translateMongoSqlScript", () => {
   it("translates each statement and leaves an existing shell command untouched", () => {
     const script = translateMongoSqlScript("SELECT * FROM users LIMIT 5; DELETE FROM users WHERE inactive = true");
     expect(splitMongoCommandRanges(script)).toHaveLength(2);
-    expect(prepareMongoQueryText("db.users.find({})", "sql", "mongodb")).toEqual({ sql: "db.users.find({})" });
+    const generated = translateMongoSqlScript("SELECT * FROM users");
+    expect(prepareMongoQueryText(generated, "sql", "mongodb", generated)).toEqual({ sql: generated });
+    expect(() => prepareMongoQueryText("db.users.drop()", "sql", "mongodb")).toThrow(MongoSqlError);
     expect(prepareMongoQueryText("SELECT * FROM users", "sql", "mysql").sql).toBe("SELECT * FROM users");
   });
 
@@ -125,13 +127,70 @@ describe("translateMongoSqlScript", () => {
     const renamed = shell("SELECT address.city AS city FROM users ORDER BY address.city");
     expect(renamed.command.kind).toBe("aggregate");
     if (renamed.command.kind !== "aggregate") return;
-    const pipeline = JSON.parse(renamed.command.pipeline) as Array<Record<string, unknown>>;
-    expect(pipeline.at(-1)).toEqual({ $sort: { city: 1 } });
+    expect(JSON.parse(renamed.command.pipeline)).toEqual([
+      { $sort: { "address.city": 1 } },
+      { $project: { city: "$address.city", _id: 0 } },
+    ]);
 
     const named = shell("SELECT window FROM window WHERE over = 1");
     expect(named.command.kind).toBe("find");
     if (named.command.kind !== "find") return;
     expect(JSON.parse(named.command.filter)).toEqual({ over: 1 });
+  });
+
+  it("strips table qualifiers from find projections", () => {
+    const aliased = shell("SELECT u.name FROM users u");
+    expect(aliased.command.kind).toBe("find");
+    if (aliased.command.kind !== "find") return;
+    expect(JSON.parse(aliased.command.projection ?? "{}")).toEqual({ name: 1, _id: 0 });
+
+    const collection = shell("SELECT users.name FROM users");
+    expect(collection.command.kind).toBe("find");
+    if (collection.command.kind !== "find") return;
+    expect(JSON.parse(collection.command.projection ?? "{}")).toEqual({ name: 1, _id: 0 });
+  });
+
+  it("keeps join owners in GROUP BY and aggregate fields", () => {
+    const grouped = shell("SELECT c.name, SUM(c.total) AS total FROM orders o INNER JOIN customers c ON o.customer_id = c._id GROUP BY c.name");
+    expect(grouped.command.kind).toBe("aggregate");
+    if (grouped.command.kind !== "aggregate") return;
+    const pipeline = JSON.parse(grouped.command.pipeline) as Array<Record<string, unknown>>;
+    expect(pipeline.find((stage) => "$group" in stage)).toEqual({ $group: { _id: "$c.name", total: { $sum: "$c.total" } } });
+
+    const multi = shell("SELECT a.x, b.x FROM lefts a INNER JOIN rights b ON a.id = b.id GROUP BY a.x, b.x");
+    expect(multi.command.kind).toBe("aggregate");
+    if (multi.command.kind !== "aggregate") return;
+    const stages = JSON.parse(multi.command.pipeline) as Array<Record<string, unknown>>;
+    expect(stages.find((stage) => "$group" in stage)).toEqual({ $group: { _id: { x: "$x", b: { x: "$b.x" } } } });
+
+    const nested = shell("SELECT address.city, profile.city FROM users GROUP BY address.city, profile.city");
+    expect(nested.command.kind).toBe("aggregate");
+    if (nested.command.kind !== "aggregate") return;
+    const nestedStages = JSON.parse(nested.command.pipeline) as Array<Record<string, unknown>>;
+    expect(nestedStages.find((stage) => "$group" in stage)).toEqual({
+      $group: { _id: { address: { city: "$address.city" }, profile: { city: "$profile.city" } } },
+    });
+  });
+
+  it("sorts before a projection removes the sort field", () => {
+    const { command } = shell("SELECT name AS n FROM users ORDER BY age");
+    expect(command.kind).toBe("aggregate");
+    if (command.kind !== "aggregate") return;
+    expect(JSON.parse(command.pipeline)).toEqual([
+      { $sort: { age: 1 } },
+      { $project: { n: "$name", _id: 0 } },
+    ]);
+  });
+
+  it("rejects negative array indexes on the query path", () => {
+    expect(() => translateMongoSqlScript("SELECT * FROM orders WHERE items[-1].name = 'kit'")).toThrow(/Negative array indexes/);
+    const projected = shell("SELECT items[-1].name FROM orders");
+    expect(projected.command.kind).toBe("find");
+    if (projected.command.kind !== "find") return;
+    expect(JSON.parse(projected.command.projection ?? "{}")).toEqual({
+      "items.-1.name": { $getField: { field: "name", input: { $arrayElemAt: ["$items", -1] } } },
+      _id: 0,
+    });
   });
 
   it("rejects SQL outside the supported subset", () => {

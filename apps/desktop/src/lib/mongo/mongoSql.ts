@@ -18,6 +18,8 @@ export type MongoQueryLanguage = "shell" | "sql";
  *
  * `!=` becomes `$ne`, which also matches documents where the field is missing.
  * Array-index projections use `$getField` and `$arrayElemAt`, which need MongoDB 4.4 or newer.
+ * Negative array indexes are rejected in WHERE, ORDER BY, GROUP BY, and UPDATE.
+ * A SELECT projection can still pass a negative index to `$arrayElemAt`.
  */
 
 export class MongoSqlError extends Error {
@@ -37,12 +39,13 @@ export function queryEditorStatementDatabaseType(databaseType: DatabaseType | un
   return databaseType;
 }
 
-export function prepareMongoQueryText(sql: string, language: MongoQueryLanguage | undefined, databaseType: string | undefined): { sql: string; generatedShell?: string } {
+export function prepareMongoQueryText(sql: string, language: MongoQueryLanguage | undefined, databaseType: string | undefined, generatedShell?: string): { sql: string; generatedShell?: string } {
   if (!mongoSqlModeActive(databaseType, language)) return { sql };
   // Pagination and refresh re-run the shell command already produced here.
-  if (splitMongoCommandRanges(sql).length > 0) return { sql };
-  const generatedShell = translateMongoSqlScript(sql);
-  return { sql: generatedShell, generatedShell };
+  // Any other shell text is SQL and must fail, instead of being executed as written.
+  if (generatedShell !== undefined && sql === generatedShell && splitMongoCommandRanges(sql).length > 0) return { sql };
+  const translated = translateMongoSqlScript(sql);
+  return { sql: translated, generatedShell: translated };
 }
 
 export function translateMongoSqlScript(sql: string): string {
@@ -199,10 +202,12 @@ class Parser {
     const table = this.parseTableRef();
     this.expectKeyword("set");
     const set: Record<string, ShellValue> = {};
+    const aliases = aliasMap(table, []);
     do {
       const field = this.parseFieldRef();
       this.expectOp("=");
-      set[expandedNames(field).join(".")] = this.parseLiteral();
+      rejectNegativeIndex(field, "UPDATE");
+      set[qualifiedPath(fieldPath(field, aliases, table))] = this.parseLiteral();
     } while (this.eatOp(","));
     const where = this.eatKeyword("where") ? this.parseExpr() : undefined;
     this.expectEnd();
@@ -680,7 +685,7 @@ function compileSelect(items: SelectItem[], from: TableRef, joins: Join[], where
   const needsAggregate = joins.length > 0 || groupBy !== undefined || items.some((item) => item.type === "agg" || (item.type === "field" && item.alias));
   if (!needsAggregate) {
     const filter = where ? exprToFilter(where, aliases) : {};
-    const projection = projectionForFind(items);
+    const projection = projectionForFind(items, aliases, from);
     const args = projection ? `${printShell(filter)}, ${printShell(projection)}` : printShell(filter);
     const chain = [orderBy.length ? `.sort(${printShell(orderDocument(orderBy, items, false, aliases, from))})` : "", offset ? `.skip(${offset})` : "", limit !== undefined ? `.limit(${limit})` : ""].join("");
     return `${mongoCall(from, "find", args)}${chain}`;
@@ -718,28 +723,31 @@ function compileSelect(items: SelectItem[], from: TableRef, joins: Join[], where
     pipeline.push({ $group: groupStage(items, groupBy, aliases, from) });
     const project = groupProject(items, groupBy, aliases, from);
     if (project) pipeline.push({ $project: project });
-  } else if (joins.length && items.some((item) => item.type === "star")) {
-    const alias = joins[0]!.table.alias ?? joins[0]!.table.collection;
-    pipeline.push({ $replaceRoot: { newRoot: { $mergeObjects: ["$$ROOT", `$${alias}`] } } });
-    pipeline.push({ $project: { [alias]: 0 } });
-  } else if (items.some((item) => item.type !== "star")) {
-    pipeline.push({ $project: projectStage(items, aliases, from) });
+    if (orderBy.length) pipeline.push({ $sort: orderDocument(orderBy, items, true, aliases, from, groupBy) });
+  } else {
+    if (orderBy.length) pipeline.push({ $sort: orderDocument(orderBy, items, false, aliases, from) });
+    if (joins.length && items.some((item) => item.type === "star")) {
+      const alias = joins[0]!.table.alias ?? joins[0]!.table.collection;
+      pipeline.push({ $replaceRoot: { newRoot: { $mergeObjects: ["$$ROOT", `$${alias}`] } } });
+      pipeline.push({ $project: { [alias]: 0 } });
+    } else if (items.some((item) => item.type !== "star")) {
+      pipeline.push({ $project: projectStage(items, aliases, from) });
+    }
   }
-  const projectsFields = groupBy !== undefined || items.some((item) => item.type !== "star");
-  if (orderBy.length) pipeline.push({ $sort: orderDocument(orderBy, items, projectsFields, aliases, from) });
   if (offset) pipeline.push({ $skip: offset });
   if (limit !== undefined) pipeline.push({ $limit: limit });
   return mongoCall(from, "aggregate", printShell(pipeline));
 }
 
-function projectionForFind(items: SelectItem[]): ShellValue | undefined {
+function projectionForFind(items: SelectItem[], aliases: AliasMap, from: TableRef): ShellValue | undefined {
   if (items.some((item) => item.type === "star")) return undefined;
   const projection: Record<string, ShellValue> = {};
   let includesId = false;
   for (const item of items) {
     if (item.type !== "field" || !item.field) continue;
-    const path = expandedNames(item.field).join(".");
-    projection[path] = fieldHasIndex(item.field) ? arrayValueExpr(item.field, "base") : 1;
+    const resolved = fieldPath(item.field, aliases, from);
+    const path = qualifiedPath(resolved);
+    projection[path] = fieldHasIndex(item.field) ? arrayValueExpr(item.field, resolved) : 1;
     if (path === "_id") includesId = true;
   }
   if (!includesId) projection._id = 0;
@@ -764,7 +772,8 @@ function groupStage(items: SelectItem[], groupBy: FieldRef[], aliases: AliasMap,
   for (const item of items) {
     if (item.type !== "agg" || !item.fn) continue;
     const name = aggregateName(item, used);
-    const path = item.star || !item.field ? undefined : `$${fieldPath(item.field, aliases, from).path}`;
+    if (item.field) rejectNegativeIndex(item.field, "an aggregate");
+    const path = item.star || !item.field ? undefined : `$${qualifiedPath(fieldPath(item.field, aliases, from))}`;
     if (item.fn === "count") {
       group[name] = item.star ? { $sum: 1 } : { $sum: { $cond: [{ $ne: [path, null] }, 1, 0] } };
     } else {
@@ -777,13 +786,34 @@ function groupStage(items: SelectItem[], groupBy: FieldRef[], aliases: AliasMap,
 
 function groupId(groupBy: FieldRef[], aliases: AliasMap, from: TableRef): ShellValue {
   if (groupBy.length === 0) return null;
-  if (groupBy.length === 1) return `$${fieldPath(groupBy[0]!, aliases, from).path}`;
+  for (const field of groupBy) rejectNegativeIndex(field, "GROUP BY");
+  if (groupBy.length === 1) return `$${qualifiedPath(fieldPath(groupBy[0]!, aliases, from))}`;
   const id: Record<string, ShellValue> = {};
   for (const field of groupBy) {
-    const resolved = fieldPath(field, aliases, from);
-    id[resolved.path.split(".").pop() ?? resolved.path] = `$${resolved.path}`;
+    const qualified = qualifiedPath(fieldPath(field, aliases, from));
+    assignGroupKey(id, qualified, `$${qualified}`);
   }
   return id;
+}
+
+function assignGroupKey(target: Record<string, ShellValue>, path: string, value: ShellValue) {
+  const parts = path.split(".");
+  let cursor = target;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const part = parts[index]!;
+    const current = cursor[part];
+    if (current === undefined) {
+      const next: Record<string, ShellValue> = {};
+      cursor[part] = next;
+      cursor = next;
+      continue;
+    }
+    if (!isDoc(current)) throw new MongoSqlError("GROUP BY keys overlap.");
+    cursor = current;
+  }
+  const leaf = parts[parts.length - 1]!;
+  if (leaf in cursor) throw new MongoSqlError("GROUP BY keys overlap.");
+  cursor[leaf] = value;
 }
 
 function groupProject(items: SelectItem[], groupBy: FieldRef[], aliases: AliasMap, from: TableRef): ShellValue | undefined {
@@ -816,10 +846,10 @@ function projectStage(items: SelectItem[], aliases: AliasMap, from: TableRef): S
   for (const item of items) {
     if (item.type === "field" && item.field) {
       const resolved = fieldPath(item.field, aliases, from);
-      const dotted = resolved.owner === "base" ? resolved.path : `${resolved.owner}.${resolved.path}`;
+      const dotted = qualifiedPath(resolved);
       const name = item.alias ?? (fieldHasIndex(item.field) ? dotted : (resolved.path.split(".").pop() ?? resolved.path));
-      const source = resolved.owner === "base" ? resolved.path : `${resolved.owner}.${resolved.path}`;
-      project[name] = fieldHasIndex(item.field) ? arrayValueExpr(item.field, resolved.owner) : item.alias || resolved.owner !== "base" ? `$${source}` : 1;
+      const source = qualifiedPath(resolved);
+      project[name] = fieldHasIndex(item.field) ? arrayValueExpr(item.field, resolved) : item.alias || resolved.owner !== "base" ? `$${source}` : 1;
       if (name === "_id") includesId = true;
     }
   }
@@ -843,16 +873,20 @@ function aggregateName(item: SelectItem, used: Set<string>): string {
   return name;
 }
 
-function orderDocument(orderBy: OrderKey[], items: SelectItem[], projectsFields: boolean, aliases: AliasMap, from: TableRef): ShellValue {
+function orderDocument(orderBy: OrderKey[], items: SelectItem[], projectsFields: boolean, aliases: AliasMap, from: TableRef, groupBy?: FieldRef[]): ShellValue {
   const sort: Record<string, ShellValue> = {};
-  for (const key of orderBy) sort[sortKey(key.field, items, projectsFields, aliases, from)] = key.direction;
+  for (const key of orderBy) sort[sortKey(key.field, items, projectsFields, aliases, from, groupBy)] = key.direction;
   return sort;
 }
 
-function sortKey(field: FieldRef, items: SelectItem[], projectsFields: boolean, aliases: AliasMap, from: TableRef): string {
+function sortKey(field: FieldRef, items: SelectItem[], projectsFields: boolean, aliases: AliasMap, from: TableRef, groupBy?: FieldRef[]): string {
+  rejectNegativeIndex(field, "ORDER BY");
   const resolved = fieldPath(field, aliases, from);
-  const full = resolved.owner === "base" ? resolved.path : `${resolved.owner}.${resolved.path}`;
-  if (!projectsFields) return full;
+  const full = qualifiedPath(resolved);
+  if (!projectsFields) {
+    const source = aliasSource(field, items);
+    return source ? qualifiedPath(fieldPath(source, aliases, from)) : full;
+  }
   for (const item of items) {
     if (item.alias && item.field && sameField(item.field, field)) return item.alias;
   }
@@ -860,8 +894,24 @@ function sortKey(field: FieldRef, items: SelectItem[], projectsFields: boolean, 
     const alias = items.find((item) => item.alias === field.parts[0]!.name);
     if (alias?.alias) return alias.alias;
   }
+  if (groupBy && groupBy.length > 1) return `_id.${full}`;
   if (fieldHasIndex(field)) return full;
   return resolved.path.split(".").pop() ?? full;
+}
+
+function aliasSource(field: FieldRef, items: SelectItem[]): FieldRef | undefined {
+  if (field.parts.length !== 1 || field.parts[0]!.indexes.length !== 0) return undefined;
+  return items.find((item) => item.alias === field.parts[0]!.name && item.field)?.field;
+}
+
+function qualifiedPath(resolved: ResolvedField): string {
+  return resolved.owner === "base" ? resolved.path : `${resolved.owner}.${resolved.path}`;
+}
+
+function rejectNegativeIndex(field: FieldRef, clause: string) {
+  if (field.parts.some((part) => part.indexes.some((index) => index < 0))) {
+    throw new MongoSqlError(`Negative array indexes are not supported in ${clause}.`);
+  }
 }
 
 function sameField(left: FieldRef, right: FieldRef): boolean {
@@ -906,17 +956,31 @@ function applyArrayIndexes(expr: ShellValue, indexes: number[]): ShellValue {
 }
 
 /** Positional projection. Inclusion `{ "items.0.name": 1 }` does not select the array element. */
-function arrayValueExpr(field: FieldRef, owner: string): ShellValue {
-  const parts = owner === "base" ? field.parts : field.parts.slice(1);
+function arrayValueExpr(field: FieldRef, resolved: ResolvedField): ShellValue {
+  const parts = stripQualifier(field, resolved);
   const head = parts[0];
   if (!head) throw new MongoSqlError("Array index requires a field.");
-  let expr: ShellValue = owner === "base" ? `$${head.name}` : `$${owner}`;
-  if (owner === "base") expr = applyArrayIndexes(expr, head.indexes);
-  for (const part of owner === "base" ? parts.slice(1) : parts) {
+  if (resolved.owner !== "base") {
+    let expr: ShellValue = `$${resolved.owner}`;
+    for (const part of parts) {
+      expr = { $getField: { field: part.name, input: expr } };
+      expr = applyArrayIndexes(expr, part.indexes);
+    }
+    return expr;
+  }
+  let expr: ShellValue = `$${head.name}`;
+  expr = applyArrayIndexes(expr, head.indexes);
+  for (const part of parts.slice(1)) {
     expr = { $getField: { field: part.name, input: expr } };
     expr = applyArrayIndexes(expr, part.indexes);
   }
   return expr;
+}
+
+function stripQualifier(field: FieldRef, resolved: ResolvedField): FieldPart[] {
+  if (resolved.owner !== "base") return field.parts.slice(1);
+  if (expandedNames(field).join(".") !== resolved.path && field.parts.length > 1) return field.parts.slice(1);
+  return field.parts;
 }
 
 function fieldPath(field: FieldRef, aliases: AliasMap, from: TableRef): ResolvedField {
@@ -980,6 +1044,7 @@ function comparisonToFilter(expr: Extract<Expr, { type: "cmp" }>, aliases: Alias
 }
 
 function filterKey(field: FieldRef, aliases: AliasMap, options?: { qualifyJoin?: boolean }): string {
+  rejectNegativeIndex(field, "WHERE");
   const resolved = fieldPath(field, aliases, aliases.base);
   if (options?.qualifyJoin && resolved.owner !== "base") return `${resolved.owner}.${resolved.path}`;
   return resolved.path;

@@ -7794,7 +7794,7 @@ export const useQueryStore = defineStore("query", () => {
       const applyMongoSql = (dbType: string | undefined) => {
         if (mongoSqlConsidered || dbType !== "mongodb") return;
         mongoSqlConsidered = true;
-        const prepared = prepareMongoQueryText(sqlToExecute, tab.mongoQueryLanguage, dbType);
+        const prepared = prepareMongoQueryText(sqlToExecute, tab.mongoQueryLanguage, dbType, tab.mongoGeneratedShell);
         if (!prepared.generatedShell) return;
         mongoGeneratedShell = prepared.generatedShell;
         sqlToExecute = prepared.sql;
