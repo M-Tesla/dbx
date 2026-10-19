@@ -776,6 +776,11 @@ export default withEnglishFallback({
     alwaysOnTopOff: "ไม่ให้อยู่ด้านบน",
     blockDangerousRedisCommands: "บล็อกคำสั่งที่มีความเสี่ยง",
     multiDbExecute: "การเรียกใช้หลายฐานข้อมูล",
+    mongoQueryLanguage: "ภาษาสอบถาม MongoDB",
+    mongoShellMode: "Shell",
+    mongoSqlMode: "SQL",
+    copyMongoShell: "คัดลอก shell ที่สร้างขึ้น",
+    mongoShellCopied: "คัดลอกคำสั่ง Mongo shell แล้ว",
   },
   multiDbExecute: {
     manualTransaction: "Transaction แบบ Manual",
@@ -2470,6 +2475,8 @@ export default withEnglishFallback({
   queryMessages: {
     empty: "ไม่มีข้อความ",
     code: "โค้ด: {code}",
+    mongoShell: "mongo shell ที่สร้างขึ้น",
+    copyMongoShell: "คัดลอก shell",
   },
   chart: {
     title: "แผนภูมิ",
